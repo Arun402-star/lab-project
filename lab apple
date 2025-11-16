@@ -1,0 +1,515 @@
+labreports-nextjs/
+├─ package.json
+├─ README.md
+├─ .env.example
+├─ next.config.js
+├─ prisma/ (optional) or migrations/
+|   └─ schema.prisma
+├─ lib/
+|   ├─ db.js         # Postgres helper (pg) or Prisma client
+|   ├─ s3.js         # S3 presigned URL helpers
+|   └─ stripe.js     # Stripe helper
+├─ pages/
+|   ├─ _app.js
+|   ├─ index.js
+|   ├─ login.js
+|   ├─ dashboard.js
+|   ├─ admin/
+|   |   └─ upload.js
+|   └─ api/
+|       ├─ auth/
+|       |   ├─ register.js
+|       |   └─ login.js
+|       ├─ upload-url.js
+|       ├─ create-checkout-session.js
+|       ├─ webhooks/stripe.js
+|       └─ reports/
+|           └─ [id]/download.js
+└─ prisma/
+    └─ schema.prisma
+
+
+---
+
+How to use this canvas
+
+I put the full starter project files into this document. You can open and copy each file into your editor. After that I'll help you deploy and configure keys (S3, Stripe, Postgres).
+
+
+---
+
+Included files (full content)
+
+package.json
+
+{
+  "name": "labreports-nextjs",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "migrate": "prisma migrate dev"
+  },
+  "dependencies": {
+    "next": "14.0.0",
+    "react": "18.2.0",
+    "react-dom": "18.2.0",
+    "bcrypt": "^5.1.0",
+    "pg": "^8.10.0",
+    "aws-sdk": "^2.1339.0",
+    "stripe": "^12.0.0",
+    "jsonwebtoken": "^9.0.0",
+    "cookie": "^0.5.0",
+    "prisma": "^5.8.0"
+  }
+}
+
+
+---
+
+.env.example
+
+# Next.js
+NEXT_PUBLIC_BASE_URL=http://localhost:3000
+BASE_URL=http://localhost:3000
+
+# Postgres (managed DB)
+DATABASE_URL=postgresql://user:pass@host:5432/dbname
+
+# AWS S3
+S3_BUCKET=your-bucket-name
+AWS_REGION=your-region
+AWS_ACCESS_KEY_ID=AKIA...
+AWS_SECRET_ACCESS_KEY=...
+
+# Stripe
+STRIPE_SECRET_KEY=sk_test_...
+STRIPE_WEBHOOK_SECRET=whsec_...
+
+# JWT
+JWT_SECRET=change_this_to_a_long_random_value
+
+# App
+NODE_ENV=development
+
+
+---
+
+prisma/schema.prisma
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id        String   @id @default(uuid())
+  email     String   @unique
+  password  String?
+  name      String?
+  role      String   @default("patient")
+  phone     String?
+  createdAt DateTime @default(now())
+  reports   Report[] @relation("patient_reports")
+}
+
+model Report {
+  id         String   @id @default(uuid())
+  patientId  String
+  patient    User     @relation(fields: [patientId], references: [id], name: "patient_reports")
+  labId      String?
+  fileKey    String
+  filename   String
+  priceCents Int      @default(0)
+  status     String   @default("uploaded")
+  uploadedBy String?
+  uploadedAt DateTime @default(now())
+  payments   Payment[]
+  accesses   AccessLog[]
+}
+
+model Payment {
+  id            String   @id @default(uuid())
+  reportId      String
+  report        Report   @relation(fields: [reportId], references: [id])
+  userId        String
+  stripePayment String?
+  amountCents   Int
+  currency      String
+  status        String
+  createdAt     DateTime @default(now())
+}
+
+model AccessLog {
+  id        String   @id @default(uuid())
+  userId    String
+  reportId  String
+  action    String
+  ip        String?
+  userAgent String?
+  ts        DateTime @default(now())
+}
+
+
+---
+
+lib/db.js (Prisma client wrapper)
+
+import { PrismaClient } from '@prisma/client';
+const prisma = global.prisma || new PrismaClient();
+if (process.env.NODE_ENV === 'development') global.prisma = prisma;
+export default prisma;
+
+
+---
+
+lib/s3.js
+
+import AWS from 'aws-sdk';
+const s3 = new AWS.S3({
+  region: process.env.AWS_REGION,
+  accessKeyId: process.env.AWS_ACCESS_KEY_ID,
+  secretAccessKey: process.env.AWS_SECRET_ACCESS_KEY,
+});
+
+export async function createUploadUrl({ key, contentType = 'application/pdf' }){
+  const url = await s3.getSignedUrlPromise('putObject', {
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    Expires: 300,
+    ContentType: contentType,
+    ServerSideEncryption: 'AES256'
+  });
+  return url;
+}
+
+export async function createDownloadUrl(key, expires = 120){
+  return s3.getSignedUrlPromise('getObject', {
+    Bucket: process.env.S3_BUCKET,
+    Key: key,
+    Expires: expires
+  });
+}
+
+
+---
+
+lib/stripe.js
+
+import Stripe from 'stripe';
+export const stripe = new Stripe(process.env.STRIPE_SECRET_KEY, { apiVersion: '2024-11-15' });
+
+
+---
+
+pages/api/auth/register.js
+
+import prisma from '../../../lib/db';
+import bcrypt from 'bcrypt';
+
+export default async function handler(req, res){
+  if (req.method !== 'POST') return res.status(405).end();
+  const { email, password, name } = req.body;
+  if (!email || !password) return res.status(400).json({ error: 'Missing' });
+  const existing = await prisma.user.findUnique({ where: { email } });
+  if (existing) return res.status(409).json({ error: 'User exists' });
+  const hash = await bcrypt.hash(password, 10);
+  const user = await prisma.user.create({ data: { email, password: hash, name } });
+  res.json({ ok: true, user: { id: user.id, email: user.email } });
+}
+
+
+---
+
+pages/api/auth/login.js
+
+import prisma from '../../../lib/db';
+import bcrypt from 'bcrypt';
+import jwt from 'jsonwebtoken';
+import cookie from 'cookie';
+
+export default async function handler(req,res){
+  if (req.method !== 'POST') return res.status(405).end();
+  const { email, password } = req.body;
+  const user = await prisma.user.findUnique({ where: { email } });
+  if (!user || !user.password) return res.status(401).json({ error: 'Invalid' });
+  const ok = await bcrypt.compare(password, user.password);
+  if (!ok) return res.status(401).json({ error: 'Invalid' });
+  const token = jwt.sign({ userId: user.id, role: user.role }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.setHeader('Set-Cookie', cookie.serialize('token', token, { httpOnly: true, secure: process.env.NODE_ENV === 'production', path: '/', sameSite: 'lax', maxAge: 7*24*60*60 }));
+  res.json({ ok: true });
+}
+
+
+---
+
+pages/api/upload-url.js
+
+import { createUploadUrl } from '../../lib/s3';
+import prisma from '../../lib/db';
+import jwt from 'jsonwebtoken';
+
+export default async function handler(req,res){
+  if (req.method !== 'POST') return res.status(405).end();
+  // simple auth via token cookie
+  const { authorization } = req.headers;
+  try{
+    const { filename, patientId, priceCents } = req.body;
+    // generate safe key
+    const key = reports/${Date.now()}_${filename.replace(/[^a-zA-Z0-9.-]/g,'')};
+    const url = await createUploadUrl({ key });
+    // create report metadata (status: awaiting_payment if price>0)
+    await prisma.report.create({ data: {
+      patientId,
+      fileKey: key,
+      filename,
+      priceCents: priceCents || 0,
+      status: priceCents > 0 ? 'awaiting_payment' : 'paid',
+      uploadedBy: null
+    }});
+    res.json({ uploadUrl: url, key });
+  }catch(err){
+    console.error(err);
+    res.status(500).json({ error: 'Server error' });
+  }
+}
+
+
+---
+
+pages/api/create-checkout-session.js
+
+import { stripe } from '../../lib/stripe';
+import prisma from '../../lib/db';
+
+export default async function handler(req,res){
+  if (req.method !== 'POST') return res.status(405).end();
+  const { reportId } = req.body;
+  const report = await prisma.report.findUnique({ where:{ id: reportId } });
+  if (!report) return res.status(404).json({ error: 'Not found' });
+  const session = await stripe.checkout.sessions.create({
+    payment_method_types: ['card'],
+    mode: 'payment',
+    line_items: [{
+      price_data: {
+        currency: 'inr',
+        product_data: { name: Report ${report.filename} },
+        unit_amount: report.priceCents,
+      },
+      quantity: 1
+    }],
+    success_url: ${process.env.BASE_URL}/reports/${reportId}?status=paid,
+    cancel_url: ${process.env.BASE_URL}/reports/${reportId}?status=cancelled,
+    metadata: { reportId }
+  });
+  // create payment record
+  await prisma.payment.create({ data: {
+    reportId: report.id,
+    userId: report.patientId,
+    stripePayment: session.id,
+    amountCents: report.priceCents,
+    currency: 'inr',
+    status: 'pending'
+  }});
+  res.json({ url: session.url });
+}
+
+
+---
+
+pages/api/webhooks/stripe.js
+
+import { stripe } from '../../../lib/stripe';
+import prisma from '../../../lib/db';
+
+export const config = { api: { bodyParser: false } };
+
+import getRawBody from 'raw-body';
+
+export default async function handler(req,res){
+  const sig = req.headers['stripe-signature'];
+  const buf = await getRawBody(req);
+  let event;
+  try {
+    event = stripe.webhooks.constructEvent(buf, sig, process.env.STRIPE_WEBHOOK_SECRET);
+  } catch (err) {
+    console.error('Webhook signature error', err.message);
+    return res.status(400).send(Webhook Error: ${err.message});
+  }
+  if (event.type === 'checkout.session.completed'){
+    const session = event.data.object;
+    const reportId = session.metadata.reportId;
+    // mark payment + report
+    await prisma.payment.updateMany({ where: { stripePayment: session.id }, data: { status: 'succeeded' } });
+    await prisma.report.update({ where: { id: reportId }, data: { status: 'paid' } });
+  }
+  res.json({ received: true });
+}
+
+
+---
+
+pages/api/reports/[id]/download.js
+
+import prisma from '../../../../lib/db';
+import { createDownloadUrl } from '../../../../lib/s3';
+import jwt from 'jsonwebtoken';
+
+export default async function handler(req,res){
+  if (req.method !== 'GET') return res.status(405).end();
+  const { id } = req.query;
+  // authenticate user via cookie header (implementation left simple)
+  const token = req.cookies?.token || null;
+  try{
+    const payload = token ? jwt.verify(token, process.env.JWT_SECRET) : null;
+    const userId = payload?.userId;
+    const report = await prisma.report.findUnique({ where: { id } });
+    if (!report) return res.status(404).end();
+    if (report.patientId !== userId) return res.status(403).json({ error: 'Forbidden' });
+    if (report.status !== 'paid') return res.status(402).json({ error: 'Payment required' });
+    const url = await createDownloadUrl(report.fileKey);
+    // log access
+    await prisma.accessLog.create({ data: { userId, reportId: id, action: 'download', ip: req.headers['x-forwarded-for'] || req.socket.remoteAddress, userAgent: req.headers['user-agent'] } });
+    res.json({ url });
+  }catch(err){
+    console.error(err);
+    res.status(401).json({ error: 'Unauthorized' });
+  }
+}
+
+
+---
+
+pages/index.js (simple landing + link to dashboard)
+
+import Link from 'next/link';
+export default function Home(){
+  return (
+    <main style={{padding:24}}>
+      <h1>LabReports</h1>
+      <p>Secure patient reports, pay & download.</p>
+      <Link href="/login">Login</Link>
+    </main>
+  );
+}
+
+
+---
+
+pages/login.js (minimal login form)
+
+import { useState } from 'react';
+import Router from 'next/router';
+export default function Login(){
+  const [email,setEmail]=useState('');
+  const [password,setPassword]=useState('');
+  async function submit(e){
+    e.preventDefault();
+    const res = await fetch('/api/auth/login',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({email,password})});
+    if (res.ok) Router.push('/dashboard');
+    else alert('login failed');
+  }
+  return (
+    <form onSubmit={submit} style={{maxWidth:400,margin:24}}>
+      <h2>Login</h2>
+      <input value={email} onChange={e=>setEmail(e.target.value)} placeholder="Email" />
+      <input value={password} onChange={e=>setPassword(e.target.value)} placeholder="Password" type="password" />
+      <button type="submit">Login</button>
+    </form>
+  );
+}
+
+
+---
+
+pages/dashboard.js (patient view of reports)
+
+import { useEffect, useState } from 'react';
+import Router from 'next/router';
+
+export default function Dashboard(){
+  const [reports,setReports]=useState([]);
+  useEffect(()=>{(async()=>{
+    const r = await fetch('/api/my/reports');
+    if (r.status===401) Router.push('/login');
+    const data = await r.json();
+    setReports(data);
+  })()},[]);
+  return (
+    <main style={{padding:24}}>
+      <h2>Your Reports</h2>
+      <ul>
+        {reports.map(r=> (
+          <li key={r.id}>
+            {r.filename} - {r.status} {r.priceCents>0 && <button onClick={()=>window.location.href=/pay/${r.id}}>Pay & View</button>}
+            {r.status==='paid' && <button onClick={async()=>{
+              const res = await fetch(/api/reports/${r.id}/download);
+              const j = await res.json();
+              window.open(j.url,'_blank');
+            }}>View / Download</button>}
+          </li>
+        ))}
+      </ul>
+    </main>
+  );
+}
+
+
+---
+
+pages/admin/upload.js (lab staff upload helper)
+
+import { useState } from 'react';
+export default function Upload(){
+  const [file,setFile]=useState(null);
+  const [patientId,setPatientId]=useState('');
+  const [price,setPrice]=useState(0);
+  async function submit(e){
+    e.preventDefault();
+    if (!file) return alert('choose file');
+    const r = await fetch('/api/upload-url',{method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({filename:file.name, patientId, priceCents: Math.round(price*100)})});
+    const j = await r.json();
+    // upload file to S3
+    await fetch(j.uploadUrl, { method: 'PUT', headers: { 'Content-Type': 'application/pdf' }, body: file });
+    alert('uploaded');
+  }
+  return (
+    <form onSubmit={submit} style={{padding:24}}>
+      <h2>Upload Report</h2>
+      <input placeholder="Patient ID" value={patientId} onChange={e=>setPatientId(e.target.value)} />
+      <input type="number" value={price} onChange={e=>setPrice(e.target.value)} step="0.01" />
+      <input type="file" accept="application/pdf" onChange={e=>setFile(e.target.files[0])} />
+      <button type="submit">Upload</button>
+    </form>
+  );
+}
+
+
+---
+
+README (quick setup + deployment notes)
+
+1. Copy files to a local project folder.
+2. Install dependencies: npm install
+3. Create a managed Postgres database and set DATABASE_URL in .env
+4. Create an S3 bucket and set AWS credentials in .env
+5. Create Stripe account and set STRIPE_SECRET_KEY and STRIPE_WEBHOOK_SECRET
+6. Run Prisma migrate: npm run migrate
+7. Run dev server: npm run dev
+8. Expose Stripe webhook to local dev via stripe CLI or ngrok during testing
+
+Deployment:
+- Deploy Next.js to Vercel. Configure environment variables in Vercel dashboard.
+- Use managed Postgres (Supabase/Amazon RDS/Render) and point DATABASE_URL accordingly.
+- Set up S3 bucket with proper IAM policy (least privilege). Use environment-specific buckets.
+
+Security notes:
+- Keep JWT_SECRET, AWS keys, Stripe keys private.
+- Use HTTPS only in production.
+- Run security tests and access audits before going live.
